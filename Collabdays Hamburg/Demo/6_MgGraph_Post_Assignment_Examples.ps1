@@ -1,4 +1,4 @@
-$ConfigurationProfileAssignments = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/3128dab4-2bb3-4c15-88f2-cd6a24d3572e/assignments"
+#$ConfigurationProfileAssignments = Invoke-MgGraphRequest -Method Get -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/3128dab4-2bb3-4c15-88f2-cd6a24d3572e/assignments"
 
 # Define the configuration policy ID and the group ID to be assigned
 $configurationPolicyId = "3128dab4-2bb3-4c15-88f2-cd6a24d3572e"
