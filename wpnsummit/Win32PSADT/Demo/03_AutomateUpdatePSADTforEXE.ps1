@@ -190,28 +190,6 @@ function Update-PSADTDeploymentScript {
                 $pattern = '## Install EXE Application[\s\S]*?(?=\n\s*##\s*=|\z)'
                 $scriptContent = $scriptContent -replace $pattern, ($installLogic + "`n")
             }
-            
-            # Add uninstallation logic if ProductCode is available
-            if ($InstallerInfo.ProductCode) {
-                $uninstallLogic = @"
-
-    ## Uninstall Application using ProductCode
-    Write-ADTLogEntry -Message "Uninstalling $($InstallerInfo.PackageName) using ProductCode: $($InstallerInfo.ProductCode)" -Severity 1
-    
-    # Try to uninstall using WMI/Registry ProductCode
-    `$uninstallString = Get-ADTUninstallRegistryKey -ProductCode '$($InstallerInfo.ProductCode)'
-    if (`$uninstallString) {
-        Start-ADTMsiProcess -Action Uninstall -Path '$($InstallerInfo.ProductCode)'
-    } else {
-        Write-ADTLogEntry -Message "Product not found for uninstallation: $($InstallerInfo.ProductCode)" -Severity 2
-    }
-"@
-
-                $uninstallSection = '## <Perform Uninstallation tasks here>'
-                if ($scriptContent -match [regex]::Escape($uninstallSection)) {
-                    $scriptContent = $scriptContent -replace [regex]::Escape($uninstallSection), $uninstallLogic
-                }
-            }
         }
         
         # Write updated content back to file

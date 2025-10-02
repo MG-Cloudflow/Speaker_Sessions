@@ -17,7 +17,7 @@ param(
     [string]$ProjectName,
     
     [Parameter(Mandatory = $false)]
-    [string]$ProjectPath = "C:\Github\Speaker_Sessions\wpnsummit\Win32PSADT\Demo1"
+    [string]$ProjectPath = "C:\Github\Speaker_Sessions\wpnsummit\Win32PSADT\Demo"
 )
 
 # Variables
