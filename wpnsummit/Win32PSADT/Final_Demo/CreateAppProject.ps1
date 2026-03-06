@@ -16,8 +16,6 @@
     Term to search for in Winget repository
 .PARAMETER BasePath
     Base path where downloads, PSADT projects, and documentation will be created
-.PARAMETER IncludeDocumentation
-    Switch to enable targeted documentation generation using Windows Sandbox
 #>
 
 [CmdletBinding()]
@@ -26,10 +24,7 @@ param(
     [string]$SearchTerm,
     
     [Parameter(Mandatory = $false)]
-    [string]$BasePath = "C:\Github\Speaker_Sessions\wpnsummit\Win32PSADT\Final_Demo",
-    
-    [Parameter(Mandatory = $false)]
-    [switch]$IncludeDocumentation
+    [string]$BasePath = "C:\Github\Speaker_Sessions\wpnsummit\Win32PSADT\Final_Demo"
 )
 
 function Test-WingetInstalled {
@@ -54,10 +49,10 @@ function Search-WingetApps {
     $lines = $searchResults -split "`n" | Where-Object { $_.Trim() -ne "" }
     $apps = @()
     
-    # Find the separator line to know where data starts
+    # Find the separator line (dashes) to know where data starts; handle varying winget formats
     $dataStartIndex = 0
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match "^-+\s+-+\s+-+") {
+        if ($lines[$i] -match "^[-\s]+$" -and $lines[$i] -match "-{2,}") {
             $dataStartIndex = $i + 1
             break
         }
@@ -66,15 +61,18 @@ function Search-WingetApps {
     # Parse each app line
     for ($i = $dataStartIndex; $i -lt $lines.Count; $i++) {
         $line = $lines[$i].Trim()
-        if ($line -and $line -notmatch "^\d+\s+matches\s+found" -and $line -notmatch "^More\s+than") {
+        if ($line -and
+            $line -notmatch "^\d+\s+matches?\s+found" -and
+            $line -notmatch "^More\s+than" -and
+            $line -notmatch "^Name\s+Id\s+" ) {   # skip header row if separator detection missed it
             # Split by multiple spaces to separate columns
             $parts = $line -split '\s{2,}'
             if ($parts.Count -ge 3) {
                 $apps += [PSCustomObject]@{
-                    Name = $parts[0].Trim()
-                    Id = $parts[1].Trim()
+                    Name    = $parts[0].Trim()
+                    Id      = $parts[1].Trim()
                     Version = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
-                    Source = if ($parts.Count -gt 3) { $parts[3].Trim() } else { "winget" }
+                    Source  = if ($parts.Count -gt 3) { $parts[$parts.Count - 1].Trim() } else { "winget" }
                 }
             }
         }
@@ -239,6 +237,48 @@ function Create-PSADTProject {
             Write-Host "PSAppDeployToolkit module not found. Installing..." -ForegroundColor Yellow
             Install-Module -Name PSAppDeployToolkit -Scope CurrentUser -Force -AllowClobber
             $PSADTModule = Get-Module -Name PSAppDeployToolkit -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+        }
+        else {
+            # Check PSGallery for a newer version
+            Write-Host "Installed version: $($PSADTModule.Version) — checking PSGallery for updates..." -ForegroundColor Yellow
+            try {
+                $galleryModule = Find-Module -Name PSAppDeployToolkit -Repository PSGallery -ErrorAction Stop
+                $galleryVersion = [System.Version]$galleryModule.Version
+                $installedVersion = [System.Version]$PSADTModule.Version
+
+                if ($galleryVersion -gt $installedVersion) {
+                    Write-Host "Update available: $galleryVersion (installed: $installedVersion)" -ForegroundColor Cyan
+                    $doUpdate = Read-Host "Update PSAppDeployToolkit to $galleryVersion now? (y/n)"
+                    if ($doUpdate -in @('y', 'Y')) {
+                        Write-Host "Updating PSAppDeployToolkit to $galleryVersion..." -ForegroundColor Yellow
+                        Update-Module -Name PSAppDeployToolkit -Force
+                        Write-Host "✓ Updated to version: $galleryVersion" -ForegroundColor Green
+                        Write-Host ""
+                        Write-Host "The module assembly has changed — restarting script in a new PowerShell session..." -ForegroundColor Cyan
+                        # Re-launch with the same arguments so the new assembly loads cleanly
+                        $scriptArgs = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+                        foreach ($key in $PSBoundParameters.Keys) {
+                            $val = $PSBoundParameters[$key]
+                            if ($val -is [switch]) {
+                                if ($val.IsPresent) { $scriptArgs += "-$key" }
+                            } else {
+                                $scriptArgs += "-$key", "`"$val`""
+                            }
+                        }
+                        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $scriptArgs
+                        exit
+                    }
+                    else {
+                        Write-Host "Skipping update — continuing with installed version $installedVersion" -ForegroundColor Gray
+                    }
+                }
+                else {
+                    Write-Host "✓ PSAppDeployToolkit is up to date ($($PSADTModule.Version))" -ForegroundColor Green
+                }
+            }
+            catch {
+                Write-Host "Could not reach PSGallery to check for updates: $($_.Exception.Message)" -ForegroundColor DarkYellow
+            }
         }
         
         Write-Host "Using PSAppDeployToolkit version: $($PSADTModule.Version)" -ForegroundColor Green
@@ -1078,8 +1118,8 @@ Write-Host "`nClosing Windows Sandbox..." -ForegroundColor Red
 Write-Log "Sandbox auto-close initiated after 30-second countdown" "INFO"
 Write-Log "Documentation process completed successfully" "SUCCESS"
 
-# Force close the sandbox by shutting down the system (sandbox will close automatically)
-Stop-Computer -Force
+# Gracefully shut down the sandbox so the host client can disconnect cleanly
+Stop-Computer
 '@
 
         # Replace placeholders with actual values
@@ -1227,6 +1267,13 @@ function Wait-ForDocumentationAndProcess {
             }
         } else {
             Write-Host "✓ MSI installer detected - using Zero-Config uninstall (no manual logic needed)" -ForegroundColor Green
+        }
+
+        # Populate AppProcessesToClose for all installer types
+        Write-Host "Detecting processes to close..." -ForegroundColor Cyan
+        $procSuccess = Update-PSADTProcessesToClose -ProjectPath $ProjectPath -JsonFilePath $jsonFile
+        if (-not $procSuccess) {
+            Write-Warning "Could not auto-detect processes to close - AppProcessesToClose left empty"
         }
         
         return $true
@@ -1739,6 +1786,101 @@ function Update-PSADTUninstallLogic {
     }
 }
 
+function Update-PSADTProcessesToClose {
+    param(
+        [string]$ProjectPath,
+        [string]$JsonFilePath
+    )
+
+    try {
+        $scriptPath = Join-Path $ProjectPath "Invoke-AppDeployToolkit.ps1"
+        if (-not (Test-Path $scriptPath)) {
+            Write-Warning "PSADT script not found: $scriptPath"
+            return $false
+        }
+
+        $data = Get-Content -Path $JsonFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+        $candidates  = [System.Collections.Generic.List[string]]::new()
+        $excludePattern = 'uninstall|uninst|setup|install|update|patch|redist'
+
+        # Get InstallLocation from Uninstall registry key (used as scope filter for fallback)
+        $installLocation = $null
+        foreach ($regKey in $data.NewRegistryKeys) {
+            if ($regKey.Path -like '*Uninstall*' -and $regKey.Values -and $regKey.Values.InstallLocation) {
+                $installLocation = $regKey.Values.InstallLocation.TrimEnd('\')
+                break
+            }
+        }
+
+        # Source 1 (preferred): App Paths registry keys — these are user-launchable executables
+        foreach ($regKey in $data.NewRegistryKeys) {
+            if ($regKey.Path -like '*App Paths*' -and $regKey.KeyName -like '*.exe') {
+                $procName = [System.IO.Path]::GetFileNameWithoutExtension($regKey.KeyName)
+                if ($procName -and $procName -notmatch $excludePattern -and $procName -notin $candidates) {
+                    $candidates.Add($procName)
+                }
+            }
+        }
+
+        # Source 2 (fallback): DisplayIcon from Uninstall registry key
+        if ($candidates.Count -eq 0) {
+            foreach ($regKey in $data.NewRegistryKeys) {
+                if ($regKey.Path -like '*Uninstall*' -and $regKey.Values -and $regKey.Values.DisplayIcon) {
+                    $iconPath = $regKey.Values.DisplayIcon -replace ',\d+$', ''  # strip icon index
+                    $procName = [System.IO.Path]::GetFileNameWithoutExtension($iconPath)
+                    if ($procName -and $procName -notmatch $excludePattern -and $procName -notin $candidates) {
+                        $candidates.Add($procName)
+                    }
+                    break
+                }
+            }
+        }
+
+        # Source 3 (fallback): EXE files under InstallLocation
+        if ($candidates.Count -eq 0 -and $installLocation) {
+            foreach ($file in $data.NewFiles) {
+                if ($file.Type -eq 'File' -and
+                    $file.Path -like '*.exe' -and
+                    $file.Path.StartsWith($installLocation, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    # Only files directly in InstallLocation, not subfolders
+                    $fileDir = [System.IO.Path]::GetDirectoryName($file.Path)
+                    if ($fileDir -ieq $installLocation) {
+                        $procName = [System.IO.Path]::GetFileNameWithoutExtension($file.Path)
+                        if ($procName -and $procName -notmatch $excludePattern -and $procName -notin $candidates) {
+                            $candidates.Add($procName)
+                        }
+                    }
+                }
+            }
+        }
+
+        # Sort and build the replacement string
+        $sorted = $candidates | Sort-Object
+        $arrayContent = if ($sorted.Count -gt 0) {
+            ($sorted | ForEach-Object { "'$_'" }) -join ', '
+        } else { '' }
+        $replacement = "AppProcessesToClose = @($arrayContent)"
+
+        # Regex-replace the existing AppProcessesToClose line (idempotent)
+        $content = Get-Content -Path $scriptPath -Raw -Encoding UTF8
+        $content = $content -replace 'AppProcessesToClose\s*=\s*@\([^)]*\)', $replacement
+        Set-Content -Path $scriptPath -Value $content -Encoding UTF8
+
+        if ($sorted.Count -gt 0) {
+            Write-Host "✓ AppProcessesToClose set: @($arrayContent)" -ForegroundColor Green
+        } else {
+            Write-Host "AppProcessesToClose: no user-launchable processes detected, left as @()" -ForegroundColor DarkYellow
+        }
+
+        return $true
+    }
+    catch {
+        Write-Warning "Failed to update AppProcessesToClose: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 # Main script execution
 try {
     Write-Host "Winget App Downloader + PSADT Project Creator" -ForegroundColor Cyan
@@ -1766,10 +1908,33 @@ try {
     }
     
     Write-Host "Found $($apps.Count) applications" -ForegroundColor Green
-    
-    # Display apps in grid view for selection (single selection)
-    $selectedApp = $apps | Out-GridView -Title "Select ONE application to download and create PSADT project" -OutputMode Single
-    
+
+    # Display apps as a numbered list with alternating row colours
+    $evenColor = 'Cyan'
+    $oddColor  = 'White'
+
+    Write-Host ""
+    Write-Host ("  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f "#", "Name", "Id", "Version", "Source") -ForegroundColor Gray
+    Write-Host ("  " + "-" * 82) -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt $apps.Count; $i++) {
+        $color = if ($i % 2 -eq 0) { $evenColor } else { $oddColor }
+        $row = "  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f ($i + 1), $apps[$i].Name, $apps[$i].Id, $apps[$i].Version, $apps[$i].Source
+        Write-Host $row -ForegroundColor $color
+    }
+    Write-Host ""
+
+    do {
+        $rawInput = Read-Host "Select application (1-$($apps.Count))"
+        $parsed   = 0
+        $valid    = [int]::TryParse($rawInput.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $apps.Count
+        if (-not $valid) {
+            Write-Host "Invalid selection. Please enter a number between 1 and $($apps.Count)." -ForegroundColor Red
+        }
+    } while (-not $valid)
+
+    $selectedApp = $apps[$parsed - 1]
+
     if (-not $selectedApp) {
         Write-Host "No application selected" -ForegroundColor Yellow
         return
@@ -1832,27 +1997,26 @@ try {
             Write-Host "Project location: $projectFullPath" -ForegroundColor Cyan
             Write-Host "Downloaded files: $downloadPath" -ForegroundColor Cyan
             
-            # Add documentation generation if requested
-            if ($IncludeDocumentation) {
-                Write-Host "`nGenerating targeted installation documentation..." -ForegroundColor Yellow
-                $docSuccess = New-TargetedDocumentation -ProjectPath $projectFullPath -ProjectName $projectName -AppInfo $selectedApp
+            # Generate targeted installation documentation (always runs)
+            Write-Host "`nGenerating targeted installation documentation..." -ForegroundColor Yellow
+            $docSuccess = New-TargetedDocumentation -ProjectPath $projectFullPath -ProjectName $projectName -AppInfo $selectedApp
+            
+            if ($docSuccess) {
+                Write-Host "✓ Targeted documentation setup completed!" -ForegroundColor Green
+                Write-Host "Use the generated Windows Sandbox configuration to document installation changes." -ForegroundColor Cyan
                 
-                if ($docSuccess) {
-                    Write-Host "✓ Targeted documentation setup completed!" -ForegroundColor Green
-                    Write-Host "Use the generated Windows Sandbox configuration to document installation changes." -ForegroundColor Cyan
-                    
-                    # Wait for documentation completion and process the results
-                    Write-Host "`nWaiting for documentation completion..." -ForegroundColor Yellow
-                    $jsonProcessed = Wait-ForDocumentationAndProcess -ProjectPath $projectFullPath -InstallerType $fileInfo.Type
-                    
-                    if ($jsonProcessed) {
-                        Write-Host "✓ Documentation processing completed successfully!" -ForegroundColor Green
-                    } else {
-                        Write-Warning "Documentation processing had issues - please review manually"
-                    }
+                # Wait for documentation completion and process the results
+                Write-Host "`nWaiting for documentation completion..." -ForegroundColor Yellow
+                $fileInfo = Get-InstallerFileInfo -FilesPath $downloadPath
+                $jsonProcessed = Wait-ForDocumentationAndProcess -ProjectPath $projectFullPath -InstallerType $fileInfo.Type
+                
+                if ($jsonProcessed) {
+                    Write-Host "✓ Documentation processing completed successfully!" -ForegroundColor Green
                 } else {
-                    Write-Warning "Documentation generation had issues - please review manually"
+                    Write-Warning "Documentation processing had issues - please review manually"
                 }
+            } else {
+                Write-Warning "Documentation generation had issues - please review manually"
             }
             
             # Open project folder
