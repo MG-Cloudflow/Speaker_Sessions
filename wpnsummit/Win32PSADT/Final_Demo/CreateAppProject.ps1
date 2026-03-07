@@ -14,6 +14,8 @@
     This script provides end-to-end automation from app discovery to deployment-ready PSADT projects.
 .PARAMETER SearchTerm
     Term to search for in Winget repository
+.PARAMETER Id
+    Winget package ID to use directly (skips search). Example: 'Git.Git'
 .PARAMETER BasePath
     Base path where downloads, PSADT projects, and documentation will be created
 #>
@@ -22,6 +24,9 @@
 param(
     [Parameter(Mandatory = $false)]
     [string]$SearchTerm,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Id,
     
     [Parameter(Mandatory = $false)]
     [string]$BasePath = "C:\Github\Speaker_Sessions\wpnsummit\Win32PSADT\Final_Demo"
@@ -414,8 +419,8 @@ function Get-YAMLInstallerInfo {
             $installerInfo.ProductCode = $matches[1].Trim()
         }
         
-        # Parse installer switches
-        if ($yamlContent -match 'InstallerSwitches:\s*\n\s+Silent:\s*(.+)') {
+        # Parse installer switches (Silent: may appear after other keys under InstallerSwitches:)
+        if ($yamlContent -match '(?s)InstallerSwitches:.*?\n\s+Silent:\s*([^\n]+)') {
             $installerInfo.SilentArgs = $matches[1].Trim()
         }
         
@@ -504,7 +509,7 @@ function Configure-PSADTForInstaller {
         
         # Silent installation
         `$installArgs = '$silentArgs'
-        Start-ADTProcess -FilePath `$installerPath -ArgumentList `$installArgs -WaitForMsiExec
+        Start-ADTProcess -FilePath `$installerPath -ArgumentList `$installArgs
         
         Write-ADTLogEntry -Message "$packageName installation completed" -Severity 1
     } else {
@@ -545,7 +550,13 @@ function Configure-PSADTForInstaller {
         
         # Write updated content back to file
         Set-Content -Path $scriptPath -Value $scriptContent -Encoding UTF8
-        
+
+        # Apply org template branding and dialog settings
+        if ($script:OrgTemplate) {
+            Write-Host 'Applying org template...' -ForegroundColor Cyan
+            Apply-OrgTemplate -ProjectPath $ProjectPath -Template $script:OrgTemplate | Out-Null
+        }
+
         Write-Host "✓ PSADT script configured successfully!" -ForegroundColor Green
         return $true
     }
@@ -1306,8 +1317,6 @@ function New-IntuneRequirementScript {
                 $entry = $prop.Value
                 if ($entry.DisplayName) {
                     $appEntries += $entry
-                    
-                    # Extract product codes from UninstallString if present
                     if ($entry.UninstallString -and $entry.UninstallString -match '\{[A-F0-9-]{36}\}') {
                         $productCodes += $matches[0]
                     }
@@ -1319,36 +1328,59 @@ function New-IntuneRequirementScript {
                 if ($regItem.Values -and $regItem.Values.DisplayName) {
                     $entry = $regItem.Values
                     $appEntries += $entry
-                    
-                    # Extract product codes from UninstallString if present
                     if ($entry.UninstallString -and $entry.UninstallString -match '\{[A-F0-9-]{36}\}') {
                         $productCodes += $matches[0]
                     }
-                    
-                    # Also check if the registry path contains a GUID (product code)
                     if ($regItem.Path -and $regItem.Path -match '\{[A-F0-9-]{36}\}') {
                         $productCodes += $matches[0]
                     }
                 }
             }
+        } elseif ($jsonContent.NewPrograms -and $jsonContent.NewPrograms.Count -gt 0) {
+            # NewPrograms array structure
+            foreach ($prog in $jsonContent.NewPrograms) {
+                if ($prog.DisplayName) {
+                    $appEntries += $prog
+                    if ($prog.UninstallString -and $prog.UninstallString -match '\{[A-F0-9-]{36}\}') {
+                        $productCodes += $matches[0]
+                    }
+                }
+            }
         }
-        
-        if ($appEntries.Count -eq 0) {
-            Write-Warning "No application entries found in JSON file"
-            return $false
+
+        # If no entries found from JSON, fall back to the YAML manifest in the Files folder
+        $appName = $null; $appVersion = $null; $publisher = $null
+        if ($appEntries.Count -gt 0) {
+            $mainApp    = $appEntries[0]
+            $appName    = $mainApp.DisplayName
+            $appVersion = $mainApp.DisplayVersion
+            $publisher  = $mainApp.Publisher
+            Write-Host "Extracted info for: $appName" -ForegroundColor Green
+            if ($appVersion) { Write-Host "  Version: $appVersion" -ForegroundColor White }
+            if ($publisher)  { Write-Host "  Publisher: $publisher" -ForegroundColor White }
+            Write-Host "  Registry Entries: $($appEntries.Count)" -ForegroundColor White
+            if ($productCodes.Count -gt 0) { Write-Host "  Product Codes: $($productCodes.Count)" -ForegroundColor White }
+        } else {
+            # Fallback: parse the winget YAML in Files\
+            $yamlFile = Get-ChildItem (Join-Path $ProjectPath 'Files') -Filter '*.yaml' -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+            if ($yamlFile) {
+                $yamlText = Get-Content $yamlFile.FullName -Raw
+                if ($yamlText -match 'PackageName:\s*(.+)')    { $appName    = $Matches[1].Trim() }
+                if ($yamlText -match 'PackageVersion:\s*(.+)') { $appVersion = $Matches[1].Trim() }
+                if ($yamlText -match 'Publisher:\s*(.+)')      { $publisher  = $Matches[1].Trim() }
+                if ($yamlText -match "ProductCode:\s*'?(\{[A-F0-9-]{36}\})'?") { $productCodes += $Matches[1] }
+                if ($appName) {
+                    Write-Host "JSON had no program entries — using YAML manifest as fallback" -ForegroundColor Yellow
+                    Write-Host "  App: $appName  Version: $appVersion" -ForegroundColor White
+                    if ($productCodes.Count -gt 0) { Write-Host "  Product Code: $($productCodes[0])" -ForegroundColor White }
+                }
+            }
+            if (-not $appName) {
+                Write-Warning "No application entries found in JSON file and no YAML fallback available"
+                return $false
+            }
         }
-        
-        # Use the first/main application entry
-        $mainApp = $appEntries[0]
-        $appName = $mainApp.DisplayName
-        $appVersion = $mainApp.DisplayVersion
-        $publisher = $mainApp.Publisher
-        
-        Write-Host "Extracted info for: $appName" -ForegroundColor Green
-        if ($appVersion) { Write-Host "  Version: $appVersion" -ForegroundColor White }
-        if ($publisher) { Write-Host "  Publisher: $publisher" -ForegroundColor White }
-        Write-Host "  Registry Entries: $($appEntries.Count)" -ForegroundColor White
-        if ($productCodes.Count -gt 0) { Write-Host "  Product Codes: $($productCodes.Count)" -ForegroundColor White }
         
         # Generate requirement script using exact logic from original
         Write-Host "Generating requirement script..." -ForegroundColor White
@@ -1621,7 +1653,8 @@ function Update-PSADTUninstallLogic {
             
             foreach ($pc in $productCodes) {
                 $codeLines += "                Write-ADTLogEntry -Message `"Uninstalling MSI with Product Code: $pc`""
-                $codeLines += "                `$exitCode = Start-ADTMsiProcess -Action 'Uninstall' -Path '$pc' -Parameters '/quiet /norestart'"
+                $codeLines += "                `$result = Start-ADTMsiProcess -Action 'Uninstall' -ProductCode '$pc' -PassThru"
+                $codeLines += "                `$exitCode = `$result.ExitCode"
                 $codeLines += "                if (`$exitCode -eq 0 -or `$exitCode -eq 3010) {"
                 $codeLines += "                    Write-ADTLogEntry -Message `"MSI uninstallation completed successfully (Exit Code: `$exitCode)`""
                 $codeLines += "                    `$uninstallSuccess = `$true"
@@ -1650,7 +1683,8 @@ function Update-PSADTUninstallLogic {
                         $codeLines += "        if (-not `$uninstallSuccess) {"
                         $codeLines += "            try {"
                         $codeLines += "                Write-ADTLogEntry -Message `"Attempting MSI uninstallation with product code: $productCode`""
-                        $codeLines += "                `$exitCode = Start-ADTMsiProcess -Action 'Uninstall' -Path '$productCode' -Parameters '/quiet /norestart'"
+                        $codeLines += "                `$result = Start-ADTMsiProcess -Action 'Uninstall' -ProductCode '$productCode' -PassThru"
+                        $codeLines += "                `$exitCode = `$result.ExitCode"
                         $codeLines += "                if (`$exitCode -eq 0 -or `$exitCode -eq 3010) {"
                         $codeLines += "                    Write-ADTLogEntry -Message `"MSI uninstallation completed successfully (Exit Code: `$exitCode)`""
                         $codeLines += "                    `$uninstallSuccess = `$true"
@@ -1683,7 +1717,8 @@ function Update-PSADTUninstallLogic {
                     $codeLines += "        if (-not `$uninstallSuccess) {"
                     $codeLines += "            try {"
                     $codeLines += "                Write-ADTLogEntry -Message `"Attempting EXE uninstallation: $exePath`""
-                    $codeLines += "                `$exitCode = Start-ADTProcess -Path '$exePath' -Parameters '$exeParams' -WaitForChildProcesses -PassThru"
+                    $codeLines += "                `$result = Start-ADTProcess -FilePath '$exePath' -ArgumentList '$exeParams' -PassThru"
+                    $codeLines += "                `$exitCode = `$result.ExitCode"
                     $codeLines += "                if (`$exitCode -eq 0 -or `$exitCode -eq 3010) {"
                     $codeLines += "                    Write-ADTLogEntry -Message `"EXE uninstallation completed successfully (Exit Code: `$exitCode)`""
                     $codeLines += "                    `$uninstallSuccess = `$true"
@@ -1881,6 +1916,462 @@ function Update-PSADTProcessesToClose {
     }
 }
 
+#region ── Org Template functions ────────────────────────────────────────────
+
+# Current version of the template schema. Bump this when new fields are added.
+$script:TemplateSchemaVersion = '2.0'
+
+function New-OrgTemplate {
+    param([PSCustomObject]$ExistingTemplate = $null)
+
+    $templateFolder = Join-Path $env:APPDATA 'IntuneToolkit'
+    if (-not (Test-Path $templateFolder)) {
+        New-Item -ItemType Directory -Path $templateFolder -Force | Out-Null
+    }
+
+    # Detect installed PSADT version for embedding in template
+    $psadtVer = (Get-Module -Name PSAppDeployToolkit -ListAvailable |
+        Sort-Object Version -Descending | Select-Object -First 1).Version.ToString()
+    if (-not $psadtVer) { $psadtVer = 'unknown' }
+
+    Write-Host ''
+    Write-Host '=== Organisation Template Wizard ===' -ForegroundColor Cyan
+    Write-Host 'Only Fluent dialog style is supported.' -ForegroundColor DarkGray
+    Write-Host 'Press Enter on any prompt to keep the default value.' -ForegroundColor DarkGray
+    Write-Host ''
+
+    function Read-TV { param([string]$P, [string]$D='') $s=if($D){"[$D] "}else{''}; $v=Read-Host "$P $s"; if([string]::IsNullOrWhiteSpace($v)){$D}else{$v.Trim()} }
+    function Read-TB { param([string]$P, [bool]$D) $d=if($D){'y'}else{'n'}; $v=Read-Host "$P (y/n) [$d]"; if([string]::IsNullOrWhiteSpace($v)){$D}else{$v.Trim() -in @('y','Y','yes','Yes','1','true','True')} }
+    function Read-TI { param([string]$P, [int]$D) $v=Read-Host "$P [$D]"; if([string]::IsNullOrWhiteSpace($v)){$D}else{$n=0;if([int]::TryParse($v.Trim(),[ref]$n)){$n}else{$D}} }
+
+    Write-Host '--- A: Identity ---' -ForegroundColor Yellow
+    $templateName = Read-TV 'Template name'                                    ($ExistingTemplate?.TemplateName    ?? 'Default')
+    $companyName  = Read-TV 'Company name (shown in dialog subtitles)'         ($ExistingTemplate?.CompanyName     ?? 'Your Organisation IT')
+    $scriptAuthor = Read-TV 'App script author'                                ($ExistingTemplate?.AppScriptAuthor ?? 'IT Packaging Team')
+
+    Write-Host ''; Write-Host '--- B: Branding (Fluent only) ---' -ForegroundColor Yellow
+    $accentColor = Read-TV 'Fluent accent hex e.g. 0xFF0078D7 (blank=default)' ($ExistingTemplate?.FluentAccentColor ?? '')
+    $logPath     = Read-TV 'Log path'                                           ($ExistingTemplate?.LogPath           ?? '$envWinDir\Logs\Software')
+
+    Write-Host ''; Write-Host '--- C: Progress Messages ---' -ForegroundColor Yellow
+    $pMsgI = Read-TV 'Progress message - Install'   ($ExistingTemplate?.ProgressMessage?.Install   ?? 'Installation in progress. Please wait...')
+    $pMsgR = Read-TV 'Progress message - Repair'    ($ExistingTemplate?.ProgressMessage?.Repair    ?? 'Repair in progress. Please wait...')
+    $pMsgU = Read-TV 'Progress message - Uninstall' ($ExistingTemplate?.ProgressMessage?.Uninstall ?? 'Uninstallation in progress. Please wait...')
+    $pDtlI = Read-TV 'Progress detail - Install'    ($ExistingTemplate?.ProgressMessageDetail?.Install   ?? 'This window will close automatically when the installation is complete.')
+    $pDtlR = Read-TV 'Progress detail - Repair'     ($ExistingTemplate?.ProgressMessageDetail?.Repair    ?? 'This window will close automatically when the repair is complete.')
+    $pDtlU = Read-TV 'Progress detail - Uninstall'  ($ExistingTemplate?.ProgressMessageDetail?.Uninstall ?? 'This window will close automatically when the uninstallation is complete.')
+
+    Write-Host ''; Write-Host '--- C: Balloon Notifications ---' -ForegroundColor Yellow
+    $balI = Read-TV 'Balloon complete - Install'   ($ExistingTemplate?.BalloonComplete?.Install   ?? 'Installation complete.')
+    $balR = Read-TV 'Balloon complete - Repair'    ($ExistingTemplate?.BalloonComplete?.Repair    ?? 'Repair complete.')
+    $balU = Read-TV 'Balloon complete - Uninstall' ($ExistingTemplate?.BalloonComplete?.Uninstall ?? 'Uninstallation complete.')
+
+    Write-Host ''; Write-Host '--- D: Install Welcome Dialog ---' -ForegroundColor Yellow
+    $wEnabled    = Read-TB 'Show Welcome dialog on install'              ($ExistingTemplate?.WelcomeDialog?.Enabled              ?? $true)
+    $wDefer      = Read-TB 'Allow deferral'                              ($ExistingTemplate?.WelcomeDialog?.AllowDefer           ?? $true)
+    $wDeferTimes = Read-TI 'Max deferrals'                               ($ExistingTemplate?.WelcomeDialog?.DeferTimes           ?? 3)
+    $wDisk       = Read-TB 'Check disk space'                            ($ExistingTemplate?.WelcomeDialog?.CheckDiskSpace       ?? $false)
+    $wPersist    = Read-TB 'Persist prompt (user cannot ignore)'         ($ExistingTemplate?.WelcomeDialog?.PersistPrompt        ?? $true)
+    $wBlock      = Read-TB 'Block app re-launch during install'          ($ExistingTemplate?.WelcomeDialog?.BlockExecution       ?? $true)
+    $wCountdown  = Read-TI 'Auto-close countdown seconds (0=off)'        ($ExistingTemplate?.WelcomeDialog?.CloseProcessesCountdown ?? 180)
+    $wCustomText = Read-TB 'Show custom text from strings.psd1'          ($ExistingTemplate?.WelcomeDialog?.CustomText           ?? $false)
+
+    Write-Host ''; Write-Host '--- D: Uninstall Welcome Dialog ---' -ForegroundColor Yellow
+    Write-Host '  (shown only when processes need closing before uninstall)' -ForegroundColor DarkGray
+    $uwEnabled   = Read-TB 'Show Welcome dialog on uninstall'            ($ExistingTemplate?.UninstallWelcomeDialog?.Enabled              ?? $true)
+    $uwCountdown = Read-TI 'Auto-close countdown seconds (0=off)'        ($ExistingTemplate?.UninstallWelcomeDialog?.CloseProcessesCountdown ?? 60)
+    $uwPersist   = Read-TB 'Persist prompt'                              ($ExistingTemplate?.UninstallWelcomeDialog?.PersistPrompt         ?? $false)
+    $uwBlock     = Read-TB 'Block app re-launch during uninstall'        ($ExistingTemplate?.UninstallWelcomeDialog?.BlockExecution        ?? $false)
+
+    Write-Host ''; Write-Host '--- D: Progress Dialog ---' -ForegroundColor Yellow
+    $prEnabled = Read-TB  'Show Progress dialog'                                         ($ExistingTemplate?.ProgressDialog?.Enabled             ?? $true)
+    $prStatus  = Read-TV  'Override status message (blank = use strings.psd1)'           ($ExistingTemplate?.ProgressDialog?.StatusMessage       ?? '')
+    $prDetail  = Read-TV  'Override detail text, Fluent only (blank = use strings.psd1)' ($ExistingTemplate?.ProgressDialog?.StatusMessageDetail ?? '')
+
+    Write-Host ''; Write-Host '--- D: Completion Prompt (Post-Install) ---' -ForegroundColor Yellow
+    $cpEnabled = Read-TB 'Show completion prompt after install'  ($ExistingTemplate?.CompletionPrompt?.Enabled         ?? $false)
+    $cpMessage = Read-TV 'Completion message'                   ($ExistingTemplate?.CompletionPrompt?.Message         ?? 'The installation has completed successfully.')
+    $cpButton  = Read-TV 'Button label'                         ($ExistingTemplate?.CompletionPrompt?.ButtonRightText ?? 'OK')
+
+    $template = [PSCustomObject]@{
+        TemplateSchemaVersion = $script:TemplateSchemaVersion
+        TemplateName          = $templateName
+        CompanyName           = $companyName
+        AppScriptAuthor       = $scriptAuthor
+        DialogStyle           = 'Fluent'
+        FluentAccentColor     = $accentColor
+        LogPath               = $logPath
+        PsadtVersion          = $psadtVer
+        ProgressMessage       = [PSCustomObject]@{ Install = $pMsgI; Repair = $pMsgR; Uninstall = $pMsgU }
+        ProgressMessageDetail = [PSCustomObject]@{ Install = $pDtlI; Repair = $pDtlR; Uninstall = $pDtlU }
+        BalloonComplete       = [PSCustomObject]@{ Install = $balI; Repair = $balR; Uninstall = $balU }
+        WelcomeDialog         = [PSCustomObject]@{
+            Enabled                 = $wEnabled
+            AllowDefer              = $wDefer
+            DeferTimes              = $wDeferTimes
+            CheckDiskSpace          = $wDisk
+            PersistPrompt           = $wPersist
+            BlockExecution          = $wBlock
+            CloseProcessesCountdown = $wCountdown
+            CustomText              = $wCustomText
+        }
+        UninstallWelcomeDialog = [PSCustomObject]@{
+            Enabled                 = $uwEnabled
+            CloseProcessesCountdown = $uwCountdown
+            PersistPrompt           = $uwPersist
+            BlockExecution          = $uwBlock
+        }
+        ProgressDialog        = [PSCustomObject]@{
+            Enabled             = $prEnabled
+            StatusMessage       = $prStatus
+            StatusMessageDetail = $prDetail
+        }
+        CompletionPrompt      = [PSCustomObject]@{
+            Enabled         = $cpEnabled
+            Message         = $cpMessage
+            ButtonRightText = $cpButton
+        }
+    }
+
+    $savePath = Join-Path $templateFolder "$templateName.json"
+    $template | ConvertTo-Json -Depth 10 | Set-Content -Path $savePath -Encoding UTF8
+    Write-Host ''
+    Write-Host "✓ Template '$templateName' saved: $savePath" -ForegroundColor Green
+    return $template
+}
+
+function Update-OrgTemplateIfNeeded {
+    param(
+        [PSCustomObject]$Template,
+        [string]$FilePath
+    )
+
+    $schemaVer   = if ($Template.TemplateSchemaVersion) { $Template.TemplateSchemaVersion } else { '1.0' }
+    $currentVer  = $script:TemplateSchemaVersion
+    $needsUpdate = ([System.Version]$schemaVer) -lt ([System.Version]$currentVer)
+
+    if (-not $needsUpdate) { return $Template }
+
+    Write-Host ''
+    Write-Host "  Template '$($Template.TemplateName)' uses schema v$schemaVer, current is v$currentVer." -ForegroundColor Yellow
+    Write-Host '  New options are available. Would you like to update the template now?' -ForegroundColor Yellow
+    $ans = Read-Host '  Update template? (y/n) [y]'
+    if ($ans.Trim() -in @('','y','Y','yes','Yes','1','true')) {
+        Write-Host '  Opening template wizard with existing values pre-filled...' -ForegroundColor Cyan
+        $updated = New-OrgTemplate -ExistingTemplate $Template
+        return $updated
+    }
+
+    # User skipped — patch missing fields silently with defaults so Apply-OrgTemplate won't fail
+    if (-not $Template.PSObject.Properties['TemplateSchemaVersion']) { $Template | Add-Member -NotePropertyName TemplateSchemaVersion -NotePropertyValue $currentVer -Force }
+    if (-not $Template.PSObject.Properties['PsadtVersion'])          { $Template | Add-Member -NotePropertyName PsadtVersion -NotePropertyValue 'unknown' -Force }
+    if (-not $Template.PSObject.Properties['DialogStyle'])           { $Template | Add-Member -NotePropertyName DialogStyle -NotePropertyValue 'Fluent' -Force }
+    if (-not $Template.PSObject.Properties['UninstallWelcomeDialog']) {
+        $Template | Add-Member -NotePropertyName UninstallWelcomeDialog -NotePropertyValue (
+            [PSCustomObject]@{ Enabled = $true; CloseProcessesCountdown = 60; PersistPrompt = $false; BlockExecution = $false }
+        ) -Force
+    }
+    return $Template
+}
+
+function Get-OrgTemplate {
+    $templateFolder = Join-Path $env:APPDATA 'IntuneToolkit'
+    if (-not (Test-Path $templateFolder)) {
+        New-Item -ItemType Directory -Path $templateFolder -Force | Out-Null
+    }
+
+    $templates = @(Get-ChildItem -Path $templateFolder -Filter '*.json' -ErrorAction SilentlyContinue)
+
+    if ($templates.Count -eq 0) {
+        Write-Host ''
+        Write-Host 'No org template found. Creating one now...' -ForegroundColor Cyan
+        return New-OrgTemplate
+    }
+
+    if ($templates.Count -eq 1) {
+        $t = Get-Content -Path $templates[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+        $t = Update-OrgTemplateIfNeeded -Template $t -FilePath $templates[0].FullName
+        Write-Host "✓ Loaded org template: $($t.TemplateName)" -ForegroundColor Green
+        return $t
+    }
+
+    # Multiple templates — show picker
+    Write-Host ''
+    Write-Host '  Multiple org templates found:' -ForegroundColor Cyan
+    Write-Host ("  {0,-4} {1}" -f '#', 'Template') -ForegroundColor Gray
+    Write-Host ("  " + "-" * 40) -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt $templates.Count; $i++) {
+        try { $label = (Get-Content -Path $templates[$i].FullName -Raw -Encoding UTF8 | ConvertFrom-Json).TemplateName }
+        catch { $label = $templates[$i].BaseName }
+        if (-not $label) { $label = $templates[$i].BaseName }
+        $color = if ($i % 2 -eq 0) { 'Cyan' } else { 'White' }
+        Write-Host ("  {0,-4} {1}" -f ($i + 1), $label) -ForegroundColor $color
+    }
+    $newIdx = $templates.Count + 1
+    $editIdx = $templates.Count + 2
+    Write-Host ("  {0,-4} {1}" -f $newIdx,  '[Create new template]') -ForegroundColor DarkGray
+    Write-Host ("  {0,-4} {1}" -f $editIdx, '[Edit existing template]') -ForegroundColor DarkGray
+    Write-Host ''
+
+    do {
+        $rawInput = Read-Host "Select template (1-$editIdx)"
+        $parsed   = 0
+        $valid    = [int]::TryParse($rawInput.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $editIdx
+        if (-not $valid) { Write-Host "Please enter a number between 1 and $editIdx." -ForegroundColor Red }
+    } while (-not $valid)
+
+    if ($parsed -eq $newIdx)  { return New-OrgTemplate }
+    if ($parsed -eq $editIdx) {
+        # Pick which one to edit then open wizard pre-filled
+        do {
+            $rawInput2 = Read-Host "Select template to edit (1-$($templates.Count))"
+            $parsed2   = 0
+            $v2 = [int]::TryParse($rawInput2.Trim(), [ref]$parsed2) -and $parsed2 -ge 1 -and $parsed2 -le $templates.Count
+            if (-not $v2) { Write-Host "Please enter a number between 1 and $($templates.Count)." -ForegroundColor Red }
+        } while (-not $v2)
+        $existing = Get-Content -Path $templates[$parsed2 - 1].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+        return New-OrgTemplate -ExistingTemplate $existing
+    }
+
+    $t = Get-Content -Path $templates[$parsed - 1].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $t = Update-OrgTemplateIfNeeded -Template $t -FilePath $templates[$parsed - 1].FullName
+    Write-Host "✓ Loaded org template: $($t.TemplateName)" -ForegroundColor Green
+    return $t
+}
+
+function Apply-OrgTemplate {
+    param(
+        [string]$ProjectPath,
+        [PSCustomObject]$Template
+    )
+
+    try {
+        # Helper: replace first regex match in string using index maths (avoids $ capture-group issues)
+        function Set-TextBlock {
+            param([string]$Text, [string]$Pattern, [string]$Replacement, [switch]$Multiline)
+            $opts = if ($Multiline) { [System.Text.RegularExpressions.RegexOptions]::Singleline } `
+                                    else { [System.Text.RegularExpressions.RegexOptions]::None }
+            $m = [regex]::Match($Text, $Pattern, $opts)
+            if (-not $m.Success) { return $Text }
+            $Text.Substring(0, $m.Index) + $Replacement + $Text.Substring($m.Index + $m.Length)
+        }
+
+        #── config.psd1 ────────────────────────────────────────────────────
+        $configPath = Join-Path $ProjectPath 'Config\config.psd1'
+        if (Test-Path $configPath) {
+            $cfg = Get-Content $configPath -Raw -Encoding UTF8
+
+            $cfg = $cfg -replace "CompanyName = '[^']*'",        "CompanyName = '$($Template.CompanyName)'"
+            $cfg = $cfg -replace "DialogStyle = '(Fluent|Classic)'", "DialogStyle = '$($Template.DialogStyle)'"
+
+            if ($Template.FluentAccentColor -and $Template.FluentAccentColor.Trim() -ne '') {
+                $cfg = $cfg -replace 'FluentAccentColor = [^\r\n]+', "FluentAccentColor = $($Template.FluentAccentColor)"
+            } else {
+                $cfg = $cfg -replace 'FluentAccentColor = [^\r\n]+', 'FluentAccentColor = $null'
+            }
+
+            if ($Template.LogPath -and $Template.LogPath.Trim() -ne '') {
+                # Only target the Toolkit.LogPath (line after its specific comment)
+                $cfg = $cfg -replace '(?m)(# Log path used for Toolkit logging\.\r?\n\s*LogPath = )[^\r\n]+', "`${1}'$($Template.LogPath)'"
+            }
+
+            Set-Content -Path $configPath -Value $cfg -Encoding UTF8
+            Write-Host '  ✓ config.psd1 updated' -ForegroundColor Green
+        }
+
+        #── strings.psd1 ───────────────────────────────────────────────────
+        $strPath = Join-Path $ProjectPath 'Strings\strings.psd1'
+        if (Test-Path $strPath) {
+            $str = Get-Content $strPath -Raw -Encoding UTF8
+
+            # BalloonTip.Complete sub-block
+            $newBalloon = "        # Text displayed in the balloon tip for successful completion of a deployment type.`r`n        Complete = @{`r`n            Install = '$($Template.BalloonComplete.Install)'`r`n            Repair = '$($Template.BalloonComplete.Repair)'`r`n            Uninstall = '$($Template.BalloonComplete.Uninstall)'`r`n        }"
+            $str = Set-TextBlock -Text $str `
+                -Pattern '(?s)        # Text displayed in the balloon tip for successful completion of a deployment type\.\r?\n        Complete = @\{[^}]*\}' `
+                -Replacement $newBalloon -Multiline
+
+            # ProgressPrompt — entire block up to RestartPrompt
+            $nl = if ($str -match '\r\n') { "`r`n" } else { "`n" }
+            $newProg = "    ProgressPrompt = @{${nl}        # Default message displayed in the progress bar.${nl}        Message = @{${nl}            Install = '$($Template.ProgressMessage.Install)'${nl}            Repair = '$($Template.ProgressMessage.Repair)'${nl}            Uninstall = '$($Template.ProgressMessage.Uninstall)'${nl}        }${nl}${nl}        # Default message detail displayed in the progress bar.${nl}        MessageDetail = @{${nl}            Install = '$($Template.ProgressMessageDetail.Install)'${nl}            Repair = '$($Template.ProgressMessageDetail.Repair)'${nl}            Uninstall = '$($Template.ProgressMessageDetail.Uninstall)'${nl}        }${nl}${nl}        # The subtitle underneath the Install Title, e.g. Company Name. Only for Fluent dialogs.${nl}        Subtitle = @{${nl}            Install = '{Toolkit\CompanyName} - App Installation'${nl}            Repair = '{Toolkit\CompanyName} - App Repair'${nl}            Uninstall = '{Toolkit\CompanyName} - App Uninstallation'${nl}        }${nl}    }"
+            $str = Set-TextBlock -Text $str `
+                -Pattern '(?s)    ProgressPrompt = @\{.*?(?=\r?\n    RestartPrompt)' `
+                -Replacement $newProg -Multiline
+
+            Set-Content -Path $strPath -Value $str -Encoding UTF8
+            Write-Host '  ✓ strings.psd1 updated' -ForegroundColor Green
+        }
+
+        #── Invoke-AppDeployToolkit.ps1 ─────────────────────────────────────
+        $scriptPath = Join-Path $ProjectPath 'Invoke-AppDeployToolkit.ps1'
+        if (Test-Path $scriptPath) {
+            $scr = Get-Content $scriptPath -Raw -Encoding UTF8
+
+            # AppScriptAuthor
+            $scr = $scr -replace "AppScriptAuthor = '[^']*'", "AppScriptAuthor = '$($Template.AppScriptAuthor)'"
+
+            # ── Install Welcome dialog ──
+            if ($Template.WelcomeDialog.Enabled) {
+                $saiwLines       = [System.Collections.Generic.List[string]]::new()  # base hashtable entries
+                $saiwCloseLines  = [System.Collections.Generic.List[string]]::new()  # only valid with CloseProcesses
+                if ($Template.WelcomeDialog.AllowDefer) {
+                    $saiwLines.Add("        AllowDefer = `$true")
+                    $saiwLines.Add("        DeferTimes = $($Template.WelcomeDialog.DeferTimes)")
+                }
+                if ($Template.WelcomeDialog.CheckDiskSpace) { $saiwLines.Add("        CheckDiskSpace = `$true") }
+                if ($Template.WelcomeDialog.PersistPrompt)  { $saiwLines.Add("        PersistPrompt = `$true") }
+                if ($Template.WelcomeDialog.CustomText) {
+                    # Only emit CustomText if strings.psd1 actually has a non-empty CustomMessage
+                    $strPathForCheck = Join-Path $ProjectPath 'Strings\strings.psd1'
+                    $hasCustomMsg = (Test-Path $strPathForCheck) -and ((Get-Content $strPathForCheck -Raw) -match "CustomMessage\s*=\s*'[^']+'")
+                    if ($hasCustomMsg) { $saiwLines.Add("        CustomText = `$true") }
+                }
+                # BlockExecution and CloseProcessesCountdown only belong to 'with processes to close' parameter sets
+                if ($Template.WelcomeDialog.BlockExecution) {
+                    $saiwCloseLines.Add("        `$saiwParams.Add('BlockExecution', `$true)")
+                }
+                if ($Template.WelcomeDialog.CloseProcessesCountdown -gt 0) {
+                    $saiwCloseLines.Add("        `$saiwParams.Add('CloseProcessesCountdown', $($Template.WelcomeDialog.CloseProcessesCountdown))")
+                }
+                $saiwBody       = $saiwLines -join "`n"
+                $saiwCloseBody  = if ($saiwCloseLines.Count -gt 0) { "`n" + ($saiwCloseLines -join "`n") } else { '' }
+                $newWelcome = "    ## Show Welcome Message, close processes if specified.`n    `$saiwParams = @{`n$saiwBody`n    }`n    if (`$adtSession.AppProcessesToClose.Count -gt 0)`n    {`n        `$saiwParams.Add('CloseProcesses', `$adtSession.AppProcessesToClose)$saiwCloseBody`n    }`n    Show-ADTInstallationWelcome @saiwParams"
+            } else {
+                $newWelcome = "    ## Welcome dialog disabled by org template."
+            }
+            # Pattern matches both original PSADT format and our re-applied format
+            $scr = Set-TextBlock -Text $scr `
+                -Pattern '(?s)    ## (?:Show Welcome Message[^\n]*\r?\n    \$saiwParams = @\{.*?    Show-ADTInstallationWelcome @saiwParams|Welcome dialog disabled by org template\.)' `
+                -Replacement $newWelcome -Multiline
+
+            # ── Uninstall Welcome dialog ──
+            $uwSettings = if ($Template.PSObject.Properties['UninstallWelcomeDialog']) { $Template.UninstallWelcomeDialog } else { $null }
+            if ($uwSettings -and $uwSettings.Enabled) {
+                $uArgs = [System.Collections.Generic.List[string]]::new()
+                if ($uwSettings.CloseProcessesCountdown -gt 0) { $uArgs.Add("-CloseProcessesCountdown $($uwSettings.CloseProcessesCountdown)") }
+                if ($uwSettings.PersistPrompt)                 { $uArgs.Add('-PersistPrompt') }
+                if ($uwSettings.BlockExecution)                { $uArgs.Add('-BlockExecution') }
+                $uArgStr = if ($uArgs.Count -gt 0) { ' ' + ($uArgs -join ' ') } else { '' }
+                $newUninstallWelcome = "    ## If there are processes to close, show Welcome Message before uninstalling.`n    if (`$adtSession.AppProcessesToClose.Count -gt 0)`n    {`n        Show-ADTInstallationWelcome -CloseProcesses `$adtSession.AppProcessesToClose$uArgStr`n    }"
+            } else {
+                $newUninstallWelcome = "    ## Uninstall welcome dialog disabled by org template."
+            }
+            $scr = Set-TextBlock -Text $scr `
+                -Pattern '(?s)    ## (?:If there are processes to close.*?\r?\n    \}|Uninstall welcome dialog disabled by org template\.)' `
+                -Replacement $newUninstallWelcome -Multiline
+
+            # ── Progress dialog (all 3 occurrences: Install, Uninstall, Repair) ──
+            if ($Template.ProgressDialog.Enabled) {
+                $progressArgs = ''
+                if ($Template.ProgressDialog.StatusMessage -and $Template.ProgressDialog.StatusMessage.Trim() -ne '') {
+                    $progressArgs += " -StatusMessage '$($Template.ProgressDialog.StatusMessage)'"
+                }
+                if ($Template.ProgressDialog.StatusMessageDetail -and $Template.ProgressDialog.StatusMessageDetail.Trim() -ne '') {
+                    $progressArgs += " -StatusMessageDetail '$($Template.ProgressDialog.StatusMessageDetail)'"
+                }
+                $newProgress = "    ## Show Progress Message (with the default message).`n    Show-ADTInstallationProgress$progressArgs"
+            } else {
+                $newProgress = "    ## Progress dialog disabled by org template."
+            }
+            $progPattern = '    ## (?:Show Progress Message[^\n]*\n    Show-ADTInstallationProgress[^\n]*|Progress dialog disabled by org template\.)'
+            $offset = 0; $replaced = 0
+            while ($replaced -lt 5) {
+                $m = [regex]::Match($scr.Substring($offset), $progPattern)
+                if (-not $m.Success) { break }
+                $absIdx = $offset + $m.Index
+                $scr = $scr.Substring(0, $absIdx) + $newProgress + $scr.Substring($absIdx + $m.Length)
+                $offset = $absIdx + $newProgress.Length
+                $replaced++
+            }
+
+            # ── Completion prompt (Post-Install) ──
+            if ($Template.CompletionPrompt.Enabled) {
+                $msg = $Template.CompletionPrompt.Message -replace "'", "''"
+                $btn = $Template.CompletionPrompt.ButtonRightText -replace "'", "''"
+                $newCompletion = "    ## Display a message at the end of the install.`n    if (!`$adtSession.UseDefaultMsi)`n    {`n        Show-ADTInstallationPrompt -Message '$msg' -ButtonRightText '$btn' -NoWait`n    }"
+            } else {
+                $newCompletion = "    ## Completion prompt disabled by org template."
+            }
+            $scr = Set-TextBlock -Text $scr `
+                -Pattern '(?s)    ## (?:Display a message at the end[^\n]*\r?\n    if \(!\$adtSession\.UseDefaultMsi\)\r?\n    \{[\s\S]*?\}|Completion prompt disabled by org template\.)' `
+                -Replacement $newCompletion -Multiline
+
+            Set-Content -Path $scriptPath -Value $scr -Encoding UTF8
+            Write-Host '  ✓ Invoke-AppDeployToolkit.ps1 updated' -ForegroundColor Green
+        }
+
+        Write-Host "✓ Org template '$($Template.TemplateName)' applied to project" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Warning "Failed to apply org template: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-AppIconFromWinget {
+    param(
+        [string]$ProjectPath,
+        [string]$FilesPath
+    )
+
+    try {
+        # Find IconUrl in any YAML file under FilesPath
+        $iconUrl = $null
+        $yamlFiles = Get-ChildItem -Path $FilesPath -Filter '*.yaml' -ErrorAction SilentlyContinue
+        foreach ($yaml in $yamlFiles) {
+            $content = Get-Content -Path $yaml.FullName -Raw -Encoding UTF8
+            if ($content -match 'IconUrl:\s*(.+)') {
+                $iconUrl = $matches[1].Trim()
+                break
+            }
+        }
+
+        if (-not $iconUrl) {
+            Write-Host 'No WinGet IconUrl found in YAML — keeping default PSADT icon' -ForegroundColor DarkYellow
+            return $false
+        }
+
+        Write-Host "Downloading app icon from WinGet: $iconUrl" -ForegroundColor Cyan
+
+        # Determine save paths
+        $assetsPath    = Join-Path $ProjectPath 'Assets'
+        $psdtAssetsPath = Join-Path $ProjectPath 'PSAppDeployToolkit\Assets'
+
+        foreach ($folder in @($assetsPath, $psdtAssetsPath)) {
+            if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+        }
+
+        $iconDest = Join-Path $assetsPath 'AppIcon.png'
+
+        $wr = Invoke-WebRequest -Uri $iconUrl -UseBasicParsing -ErrorAction Stop
+        [System.IO.File]::WriteAllBytes($iconDest, $wr.Content)
+
+        # Determine the icon file type from URL extension or Content-Type
+        $ext = [System.IO.Path]::GetExtension($iconUrl).ToLower()
+        if ($ext -notin @('.png','.ico','.jpg','.jpeg','.bmp')) { $ext = '.png' }
+
+        # If it's an ICO, save with correct extension alongside the PNG copy
+        if ($ext -eq '.ico') {
+            $icoDest = Join-Path $assetsPath 'AppIcon.ico'
+            [System.IO.File]::WriteAllBytes($icoDest, $wr.Content)
+        }
+
+        # Also copy to PSAppDeployToolkit\Assets so the toolkit's own default is replaced
+        $psdtIconDest = Join-Path $psdtAssetsPath 'AppIcon.png'
+        Copy-Item -Path $iconDest -Destination $psdtIconDest -Force
+
+        Write-Host "✓ App icon downloaded and applied to Assets\" -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Warning "Could not download app icon: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+#endregion ── Org Template functions ─────────────────────────────────────────
+
 # Main script execution
 try {
     Write-Host "Winget App Downloader + PSADT Project Creator" -ForegroundColor Cyan
@@ -1890,57 +2381,82 @@ try {
     if (-not (Test-WingetInstalled)) {
         throw "Winget is not installed or not available in PATH"
     }
-    
-    # Get search term if not provided
-    if (-not $SearchTerm) {
-        $SearchTerm = Read-Host "Enter search term for applications"
-        if ([string]::IsNullOrWhiteSpace($SearchTerm)) {
-            throw "Search term is required"
+
+    # Load (or create) org template once for this run
+    $script:OrgTemplate = Get-OrgTemplate
+
+    # -Id fast path: skip search entirely
+    if ($Id) {
+        Write-Host "Resolving package ID: $Id" -ForegroundColor Yellow
+        $showOutput = winget show --id "$Id" --exact --accept-source-agreements | Out-String
+        if ($LASTEXITCODE -ne 0 -or $showOutput -notmatch 'Found') {
+            Write-Host "Package ID '$Id' not found in winget. Verify the ID and try again." -ForegroundColor Red
+            return
         }
-    }
-    
-    # Search for apps
-    $apps = Search-WingetApps -SearchTerm $SearchTerm
-    
-    if ($apps.Count -eq 0) {
-        Write-Host "No applications found matching: $SearchTerm" -ForegroundColor Yellow
-        return
-    }
-    
-    Write-Host "Found $($apps.Count) applications" -ForegroundColor Green
-
-    # Display apps as a numbered list with alternating row colours
-    $evenColor = 'Cyan'
-    $oddColor  = 'White'
-
-    Write-Host ""
-    Write-Host ("  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f "#", "Name", "Id", "Version", "Source") -ForegroundColor Gray
-    Write-Host ("  " + "-" * 82) -ForegroundColor DarkGray
-
-    for ($i = 0; $i -lt $apps.Count; $i++) {
-        $color = if ($i % 2 -eq 0) { $evenColor } else { $oddColor }
-        $row = "  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f ($i + 1), $apps[$i].Name, $apps[$i].Id, $apps[$i].Version, $apps[$i].Source
-        Write-Host $row -ForegroundColor $color
-    }
-    Write-Host ""
-
-    do {
-        $rawInput = Read-Host "Select application (1-$($apps.Count))"
-        $parsed   = 0
-        $valid    = [int]::TryParse($rawInput.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $apps.Count
-        if (-not $valid) {
-            Write-Host "Invalid selection. Please enter a number between 1 and $($apps.Count)." -ForegroundColor Red
+        # Parse Name and Version from winget show output
+        $resolvedName    = if ($showOutput -match '(?m)^Found\s+(.+?)\s+\[') { $matches[1].Trim() } else { $Id }
+        $resolvedVersion = if ($showOutput -match '(?m)^\s*Version:\s*(.+)') { $matches[1].Trim() } else { 'Unknown' }
+        $selectedApp = [PSCustomObject]@{
+            Name    = $resolvedName
+            Id      = $Id
+            Version = $resolvedVersion
+            Source  = 'winget'
         }
-    } while (-not $valid)
-
-    $selectedApp = $apps[$parsed - 1]
-
-    if (-not $selectedApp) {
-        Write-Host "No application selected" -ForegroundColor Yellow
-        return
+        Write-Host "`nSelected: $($selectedApp.Name) v$($selectedApp.Version)" -ForegroundColor Cyan
     }
-    
-    Write-Host "`nSelected: $($selectedApp.Name) v$($selectedApp.Version)" -ForegroundColor Cyan
+    else {
+        # Get search term if not provided
+        if (-not $SearchTerm) {
+            $SearchTerm = Read-Host "Enter search term for applications"
+            if ([string]::IsNullOrWhiteSpace($SearchTerm)) {
+                throw "Search term is required"
+            }
+        }
+        
+        # Search for apps and exclude Microsoft Store results
+        $apps = Search-WingetApps -SearchTerm $SearchTerm
+        $apps = $apps | Where-Object { $_.Source -ne 'msstore' }
+        
+        if ($apps.Count -eq 0) {
+            Write-Host "No applications found matching: $SearchTerm" -ForegroundColor Yellow
+            return
+        }
+        
+        Write-Host "Found $($apps.Count) applications" -ForegroundColor Green
+
+        # Display apps as a numbered list with alternating row colours
+        $evenColor = 'Cyan'
+        $oddColor  = 'White'
+
+        Write-Host ""
+        Write-Host ("  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f "#", "Name", "Id", "Version", "Source") -ForegroundColor Gray
+        Write-Host ("  " + "-" * 82) -ForegroundColor DarkGray
+
+        for ($i = 0; $i -lt $apps.Count; $i++) {
+            $color = if ($i % 2 -eq 0) { $evenColor } else { $oddColor }
+            $row = "  {0,-3} {1,-28} {2,-32} {3,-10} {4}" -f ($i + 1), $apps[$i].Name, $apps[$i].Id, $apps[$i].Version, $apps[$i].Source
+            Write-Host $row -ForegroundColor $color
+        }
+        Write-Host ""
+
+        do {
+            $rawInput = Read-Host "Select application (1-$($apps.Count))"
+            $parsed   = 0
+            $valid    = [int]::TryParse($rawInput.Trim(), [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $apps.Count
+            if (-not $valid) {
+                Write-Host "Invalid selection. Please enter a number between 1 and $($apps.Count)." -ForegroundColor Red
+            }
+        } while (-not $valid)
+
+        $selectedApp = $apps[$parsed - 1]
+
+        if (-not $selectedApp) {
+            Write-Host "No application selected" -ForegroundColor Yellow
+            return
+        }
+        
+        Write-Host "`nSelected: $($selectedApp.Name) v$($selectedApp.Version)" -ForegroundColor Cyan
+    }
     
     # Get available architectures for the selected app
     $availableArchs = Get-WingetAppDetails -AppId $selectedApp.Id
@@ -1986,7 +2502,11 @@ try {
             # Configure PSADT based on downloaded files
             Write-Host "Configuring PSADT for installer type..." -ForegroundColor Yellow
             $psadtConfigured = Configure-PSADTForInstaller -ProjectPath $projectFullPath -AppInfo $selectedApp -Architecture $selectedArch
-            
+
+            # Download and apply the app-specific icon from WinGet YAML
+            Write-Host 'Downloading app icon from WinGet...' -ForegroundColor Cyan
+            Get-AppIconFromWinget -ProjectPath $projectFullPath -FilesPath $downloadPath | Out-Null
+
             if ($psadtConfigured) {
                 Write-Host "`n✓ SUCCESS: Project created, app downloaded, and PSADT configured!" -ForegroundColor Green
             } else {
